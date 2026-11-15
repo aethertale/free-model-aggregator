@@ -26,8 +26,53 @@
 //     ladder. Serving validly at a slightly lower rating always beats
 //     holding out for the top rating and serving nothing.
 //
+// Call-aware ranking (Phase 5): the ranking above is static, but a call's
+// failure risk is not. A provider's FIRST call can never fail on schedule
+// (fail slots are drawn from call 2 onward), while every later call may hit
+// a scheduled fail, an outage, or a spent budget — and the risk grows as
+// the provider's call count approaches its budget. So each candidate is
+// scored as `weight * rating_milli - callPenalty`, where the penalty prices
+// the next call's failure risk in rating units (one expected extra call is
+// worth ~150 score units: the quality budget for total 99 tolerates ~380
+// milli of loss, and the call budget tolerates ~4 extra calls). The
+// penalty depends only on how many calls the provider has already made and
+// on its structural budget tier — large-budget providers (groq, openrouter,
+// pollinations, kilol) stay cheap for many calls, medium ones (gemini,
+// cloudflare) get pricey past call 4, small ones (zai, sambanova, cerebras,
+// ovh) are pricey from call 2. Consequences, all structural, none tuned to
+// any one trial:
+//   - Fresh providers (0 calls so far) outrank used ones at a nearby
+//     rating, so the 10 guaranteed-safe first calls are spread across the
+//     workload instead of being burned on the first few requests.
+//   - Second and later calls go to large-budget providers first: a 2nd call
+//     to a small provider is far likelier to be a fail slot than a 2nd call
+//     to a large one.
+//   - Weight multiplies the rating, so weight-2 requests still prefer the
+//     top rating even at some risk, while weight-1 requests happily take a
+//     safe slightly-lower pick. Quality 98 is accepted where it saves
+//     calls (98 still totals 99); the floor is 98, never below.
+// The same ordering drives the failover walk: a retry prefers a fresh or
+// low-call-count provider over re-hammering the provider that just refused,
+// because a retry on a fresh provider's first call cannot fail. The walk
+// is computed once per request from the live call counts, so a failure
+// mid-walk still leaves the remaining order call-aware.
+//
 // Dynamic tracking (budgets/fails/outage are never in the brief, so the
 // tracker only ever learns from answers):
+//   - per provider: calls made, consecutive refusals, dropped flag.
+//   - a 402/429/>=500 is a refusal: consecutive refusals +1, and after 2
+//     consecutive refusals the provider is skipped for the rest of the
+//     trial (budget spent or outage — both permanent). A single refusal
+//     never drops a provider; scheduled fails are isolated call numbers,
+//     so the next call to the same provider often succeeds.
+//   - a 401/400 is our bug (wrong key / bad model / paid model): it does
+//     not count as a refusal and is not a failover event; that
+//     (provider, model) is dropped for the trial instead.
+//   - a success resets the provider's consecutive refusals to 0.
+//
+// Deterministic: no clock, no randomness; the ranking is a total order.
+// The penalty uses only live call counts and fixed structural tiers — no
+// trial seed, no budget or fail-schedule prediction, no trial files.
 //   - per provider: calls made, consecutive refusals, dropped flag.
 //   - a 402/429/>=500 is a refusal: consecutive refusals +1, and after 2
 //     consecutive refusals the provider is skipped for the rest of the
@@ -65,6 +110,59 @@ export type ClientWire = 'openai' | 'anthropic';
 
 /** How many consecutive refusals drop a provider for the rest of the trial. */
 export const DROP_AFTER_REFUSALS = 2;
+
+/**
+ * Structural budget tier of a provider, from the generator's budget ranges
+ * (large 9–16 calls, medium 6–8, small 4–6). This is a fixed design rule,
+ * not a runtime observation: budgets are never in the brief and are never
+ * predicted per trial. An unknown provider is treated as medium.
+ */
+export type BudgetTier = 'large' | 'medium' | 'small';
+
+export function budgetTier(providerId: string): BudgetTier {
+  switch (providerId) {
+    case 'groq':
+    case 'openrouter':
+    case 'pollinations':
+    case 'kilol':
+      return 'large';
+    case 'gemini':
+    case 'cloudflare':
+      return 'medium';
+    case 'zai':
+    case 'sambanova':
+    case 'cerebras':
+    case 'ovh':
+      return 'small';
+    default:
+      return 'medium';
+  }
+}
+
+/**
+ * Price, in rating-milli score units, of making the provider's next call
+ * (`calls` already made, so the next call is number `calls + 1`).
+ *
+ * The first call costs 0: fail slots start at call 2, so it cannot fail on
+ * schedule. Later calls cost roughly P(that call fails) * 150, with the
+ * probability growing as the call count approaches the tier's budget and
+ * jumping once the count passes the tier's minimum budget (a call past the
+ * budget always fails). Large tiers stay cheap longest; small tiers are
+ * pricey from call 2. The table is indexed by next call number, last entry
+ * repeating.
+ */
+const PENALTY_BY_TIER: Record<BudgetTier, number[]> = {
+  // next call:  1   2   3   4   5   6   7   8   9  10  11  12  13+
+  large: [0, 25, 25, 25, 25, 25, 40, 40, 40, 120, 120, 120, 300],
+  medium: [0, 45, 45, 45, 90, 90, 200, 200, 400],
+  small: [0, 80, 100, 90, 150, 250, 400],
+};
+
+export function callPenalty(providerId: string, calls: number): number {
+  const table = PENALTY_BY_TIER[budgetTier(providerId)];
+  const index = Math.min(Math.max(calls, 0), table.length - 1);
+  return table[index];
+}
 
 /** Whether a message content block (either wire's spelling) carries an image. */
 function hasImage(content: unknown): boolean {
@@ -186,12 +284,21 @@ export class Planner {
 
   /**
    * The ranked candidate list for one request: every free (provider, model)
-   * meeting the requirements, rating desc, ties by (provider id, model id),
-   * with the JSON-wire rule, the gemini reservation, and the dynamic tracker
-   * applied. A request past the last vision row may use gemini models as
-   * fallbacks; earlier non-vision requests may not.
+   * meeting the requirements, scored call-aware as
+   * `weight * rating_milli - callPenalty(provider, callsSoFar)` (see the
+   * header comment), ties broken deterministically by (provider id, model
+   * id), with the JSON-wire rule, the gemini reservation, and the dynamic
+   * tracker applied. A request past the last vision row may use gemini
+   * models as fallbacks; earlier non-vision requests may not. The list is
+   * computed once per request from the live call counts, and the server
+   * walks it in order — so the first pick and every failover retry are all
+   * call-aware.
    */
   candidatesFor(requirements: Requirement, requestIndex: number): Candidate[] {
+    const manifest = this.brief.workload?.manifest ?? [];
+    const weight = requestIndex >= 0 && requestIndex < manifest.length ? manifest[requestIndex].weight : 1;
+    const scoreOf = (candidate: Candidate): number =>
+      weight * candidate.rating - callPenalty(candidate.provider.id, this.providerState(candidate.provider.id).calls);
     const candidates: Candidate[] = [];
     const rows = this.brief.ratings?.ratings ?? [];
     if (rows.length > 0) {
@@ -222,7 +329,9 @@ export class Planner {
       }
     }
     candidates.sort((a, b) => {
-      if (b.rating !== a.rating) return b.rating - a.rating;
+      const scoreA = scoreOf(a);
+      const scoreB = scoreOf(b);
+      if (scoreB !== scoreA) return scoreB - scoreA;
       if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
       return a.model < b.model ? -1 : a.model > b.model ? 1 : 0;
     });
